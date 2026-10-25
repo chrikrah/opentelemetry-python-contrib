@@ -1,0 +1,1 @@
+`opentelemetry-instrumentation-botocore`: end the span of a Bedrock `ConverseStream` or `InvokeModelWithResponseStream` call when the caller stops iterating the stream early, and record the stream once when `close()` follows

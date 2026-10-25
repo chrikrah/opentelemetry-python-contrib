@@ -62,6 +62,11 @@ class ConverseStreamWrapper(BaseObjectProxy):
         except EventStreamError as exc:
             self._handle_stream_error(exc)
             raise
+        except GeneratorExit:
+            # The caller stopped iterating early. Treat the stream as done to ensure
+            # the span end, as close() does.
+            self._complete_stream(self._response)
+            raise
 
     def _process_event(self, event):
         # pylint: disable=too-many-branches
@@ -143,6 +148,9 @@ class ConverseStreamWrapper(BaseObjectProxy):
         self._complete_stream(self._response)
 
     def _complete_stream(self, response):
+        # close() and an abandoned iteration can both get here, so complete only once.
+        if self._ended:
+            return
         self._stream_done_callback(response, self._ended)
         self._ended = True
 
@@ -180,9 +188,12 @@ class InvokeModelWithResponseStreamWrapper(BaseObjectProxy):
     def close(self):
         self.__wrapped__.close()  # pylint: disable=no-member
         # Treat the stream as done to ensure the span end.
-        self._stream_done_callback(self._response, self._ended)
+        self._complete_stream(self._response)
 
     def _complete_stream(self, response):
+        # close() and an abandoned iteration can both get here, so complete only once.
+        if self._ended:
+            return
         self._stream_done_callback(response, self._ended)
         self._ended = True
 
@@ -197,6 +208,11 @@ class InvokeModelWithResponseStreamWrapper(BaseObjectProxy):
                 yield event
         except EventStreamError as exc:
             self._handle_stream_error(exc)
+            raise
+        except GeneratorExit:
+            # The caller stopped iterating early. Treat the stream as done to ensure
+            # the span end, as close() does.
+            self._complete_stream(self._response)
             raise
 
     def _process_event(self, event):

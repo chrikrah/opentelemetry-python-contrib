@@ -26,6 +26,9 @@ from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import (
     GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS,
     GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS,
 )
+from opentelemetry.semconv._incubating.metrics.gen_ai_metrics import (
+    GEN_AI_CLIENT_OPERATION_DURATION,
+)
 from opentelemetry.trace.status import StatusCode
 
 from .bedrock_utils import (
@@ -41,6 +44,16 @@ BOTO3_VERSION = tuple(int(x) for x in boto3.__version__.split("."))
 
 def filter_message_keys(message, keys):
     return {k: v for k, v in message.items() if k in keys}
+
+
+def _operation_duration_count(metric_reader):
+    (resource_metrics,) = metric_reader.get_metrics_data().resource_metrics
+    (duration,) = [
+        metric
+        for metric in resource_metrics.scope_metrics[0].metrics
+        if metric.name == GEN_AI_CLIENT_OPERATION_DURATION
+    ]
+    return sum(point.count for point in duration.data.data_points)
 
 
 @pytest.mark.skipif(BOTO3_VERSION < (1, 35, 56), reason="Converse API not available")
@@ -1264,6 +1277,44 @@ def test_converse_stream_close_before_consumption(
     assert len(logs) == 1
     user_content = filter_message_keys(messages[0], ["content"])
     assert_message_in_logs(logs[0], "gen_ai.user.message", user_content, span)
+
+
+@pytest.mark.skipif(BOTO3_VERSION < (1, 35, 56), reason="ConverseStream API not available")
+@pytest.mark.vcr()
+def test_converse_stream_break_before_end(
+    span_exporter,
+    log_exporter,
+    metric_reader,
+    bedrock_runtime_client,
+    instrument_with_content,
+):
+    messages = [{"role": "user", "content": [{"text": "Say this is a test"}]}]
+
+    llm_model_value = "amazon.titan-text-lite-v1"
+    response = bedrock_runtime_client.converse_stream(
+        messages=messages,
+        modelId=llm_model_value,
+        inferenceConfig={
+            "maxTokens": 10,
+            "temperature": 0.8,
+            "topP": 1,
+            "stopSequences": ["|"],
+        },
+    )
+
+    # A break closes the generator once it is finalized, which only CPython does
+    # at once, so close it explicitly.
+    events = iter(response["stream"])
+    next(events)
+    events.close()
+
+    (span,) = span_exporter.get_finished_spans()
+    assert span.status.status_code == StatusCode.UNSET
+
+    # A later close() must not complete the stream again.
+    response["stream"].close()
+    assert len(span_exporter.get_finished_spans()) == 1
+    assert _operation_duration_count(metric_reader) == 1
 
 
 def get_invoke_model_body(
@@ -3076,3 +3127,59 @@ def get_anthropic_tool_config():
             },
         }
     ]
+
+
+@pytest.mark.vcr()
+def test_invoke_model_with_response_stream_break_before_end(
+    span_exporter,
+    log_exporter,
+    metric_reader,
+    bedrock_runtime_client,
+    instrument_with_content,
+):
+    llm_model_value = get_model_name_from_family("anthropic.claude")
+    body = get_invoke_model_body(llm_model_value, 10, 0.8, 1, ["|"])
+    response = bedrock_runtime_client.invoke_model_with_response_stream(
+        body=body,
+        modelId=llm_model_value,
+    )
+
+    # A break closes the generator once it is finalized, which only CPython does
+    # at once, so close it explicitly.
+    events = iter(response["body"])
+    next(events)
+    events.close()
+
+    (span,) = span_exporter.get_finished_spans()
+    assert span.status.status_code == StatusCode.UNSET
+
+    # A later close() must not complete the stream again.
+    response["body"].close()
+    assert len(span_exporter.get_finished_spans()) == 1
+    assert _operation_duration_count(metric_reader) == 1
+
+
+@pytest.mark.vcr()
+def test_invoke_model_with_response_stream_close_then_break(
+    span_exporter,
+    log_exporter,
+    metric_reader,
+    bedrock_runtime_client,
+    instrument_with_content,
+):
+    llm_model_value = get_model_name_from_family("anthropic.claude")
+    body = get_invoke_model_body(llm_model_value, 10, 0.8, 1, ["|"])
+    response = bedrock_runtime_client.invoke_model_with_response_stream(
+        body=body,
+        modelId=llm_model_value,
+    )
+
+    # close() mid-iteration, then the caller leaves the loop.
+    events = iter(response["body"])
+    next(events)
+    response["body"].close()
+    events.close()
+
+    (span,) = span_exporter.get_finished_spans()
+    assert span.status.status_code == StatusCode.UNSET
+    assert _operation_duration_count(metric_reader) == 1
